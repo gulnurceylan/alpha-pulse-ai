@@ -1,0 +1,11 @@
+fastapi>=0.110.0
+uvicorn>=0.28.0
+crewai[google-genai]>=0.28.8
+yfinance>=0.2.37
+redis>=5.0.3
+pika>=1.3.2
+psycopg2-binary>=2.9.9
+requests>=2.31.0
+sqlalchemy>=2.0.0
+psycopg[binary]>=3.1.0
+python-dotenv>=1.0.0
