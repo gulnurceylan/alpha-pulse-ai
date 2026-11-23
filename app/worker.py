@@ -3,6 +3,8 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from typing import Any
 
 import pika
 import redis
@@ -31,21 +33,52 @@ def get_redis_client() -> redis.Redis:
 
 
 def _build_cache_key(symbol: str, language: str) -> str:
-    return f"alphapulse:report:{symbol.strip().upper()}:{language.strip().lower()}"
+    return f"alphapulse:v2:report:{symbol.strip().upper()}:{language.strip().lower()}"
+
+
+def _stream_channel(report_id: int) -> str:
+    return f"alphapulse:stream:{report_id}"
+
+
+def _publish_stream_event(
+    redis_client: redis.Redis,
+    report_id: int,
+    status: str,
+    step: str,
+    message: str,
+) -> None:
+    """Publishes real-time pipeline progress to Redis Pub/Sub for SSE consumers."""
+    event = {
+        "report_id": report_id,
+        "status": status,
+        "step": step,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        redis_client.publish(_stream_channel(report_id), json.dumps(event))
+    except Exception as pub_err:
+        logger.warning("Redis Pub/Sub publish skipped for report_id=%s: %s", report_id, pub_err)
 
 
 def _run_analysis_heartbeat_safe(
     connection: pika.BlockingConnection,
+    report_id: int,
     symbol: str,
     language: str,
-) -> str:
+) -> dict[str, Any]:
     """
     Executes the multi-agent analysis in a worker thread while periodically
     servicing RabbitMQ events on the main thread so long-running AI tasks
     never trigger an AMQP heartbeat timeout.
     """
+    stream_redis = get_redis_client()
+
+    def on_progress(step: str, message: str) -> None:
+        _publish_stream_event(stream_redis, report_id, "PROCESSING", step, message)
+
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(run_financial_analysis, symbol, language)
+        future = executor.submit(run_financial_analysis, symbol, language, on_progress)
         while not future.done():
             connection.process_data_events(time_limit=1)
             time.sleep(2)
@@ -62,6 +95,7 @@ def process_analysis_job(
     db = SessionLocal()
     redis_client = get_redis_client()
     report_record = None
+    report_id = None
 
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -84,29 +118,47 @@ def process_analysis_job(
 
         report_record.status = "PROCESSING"
         db.commit()
+        _publish_stream_event(
+            redis_client,
+            report_id,
+            "PROCESSING",
+            "JOB_STARTED",
+            f"Worker picked up analysis job for {symbol}.",
+        )
 
         cache_key = _build_cache_key(symbol, language)
-        cached_report = None
+        cached_bundle = None
         try:
-            cached_report = redis_client.get(cache_key)
+            raw_cached = redis_client.get(cache_key)
+            if raw_cached:
+                cached_bundle = json.loads(raw_cached)
         except Exception as cache_err:
             logger.warning("Redis read skipped (%s): %s", cache_key, cache_err)
 
-        if cached_report:
-            logger.info("Cache HIT for %s (%s). Serving stored report.", symbol, language)
-            report_text = cached_report
+        if isinstance(cached_bundle, dict) and "report" in cached_bundle:
+            logger.info("Cache HIT for %s (%s). Serving stored report & quant data.", symbol, language)
+            result_bundle = cached_bundle
         else:
-            logger.info("Cache MISS for %s (%s). Running AI research crew...", symbol, language)
-            report_text = _run_analysis_heartbeat_safe(ch.connection, symbol, language)
+            logger.info("Cache MISS for %s (%s). Running quant engine & AI research crew...", symbol, language)
+            result_bundle = _run_analysis_heartbeat_safe(ch.connection, report_id, symbol, language)
             try:
-                redis_client.setex(cache_key, CACHE_TTL_SECONDS, report_text)
-                logger.info("Cached report in Redis under key=%s (TTL=%ss)", cache_key, CACHE_TTL_SECONDS)
+                redis_client.setex(cache_key, CACHE_TTL_SECONDS, json.dumps(result_bundle))
+                logger.info("Cached report bundle in Redis under key=%s (TTL=%ss)", cache_key, CACHE_TTL_SECONDS)
             except Exception as cache_err:
                 logger.warning("Redis write skipped (%s): %s", cache_key, cache_err)
 
-        report_record.report = report_text
+        report_record.report = result_bundle.get("report")
+        report_record.quant_data = result_bundle.get("quant_data")
         report_record.status = "COMPLETED"
         db.commit()
+
+        _publish_stream_event(
+            redis_client,
+            report_id,
+            "COMPLETED",
+            "FINISHED",
+            f"Institutional quantitative & AI research report for {symbol} is ready.",
+        )
         logger.info("Completed task | report_id=%s symbol=%s", report_id, symbol)
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -121,6 +173,15 @@ def process_analysis_job(
                 db.commit()
             except Exception as db_err:
                 logger.error("Failed to update FAILED status in PostgreSQL: %s", db_err)
+
+        if report_id is not None:
+            _publish_stream_event(
+                redis_client,
+                report_id,
+                "FAILED",
+                "ERROR",
+                f"Analysis failed: {str(exc)}",
+            )
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
     finally:

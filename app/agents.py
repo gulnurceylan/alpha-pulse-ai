@@ -1,32 +1,25 @@
+import json
 import os
+from collections.abc import Callable
+from typing import Any
+
 import yfinance as yf
-from dotenv import load_dotenv
 from crewai import Agent, Crew, LLM, Process, Task
 from crewai.tools import tool
+from dotenv import load_dotenv
+
+from app.quant_engine import compute_quantitative_profile
 
 load_dotenv()
 
 # Priority failover chain: Always starts with the flagship model,
-# switching immediately on upstream 503/429 overload errors.
+# switching immediately on upstream 503/429/504 overload errors.
 MODEL_PRIORITY_CHAIN = [
     "gemini/gemini-4-hydrogen",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-3.6-flash",
     "gemini/gemini-3.5-flash",
 ]
-
-
-def _format_large_number(value) -> str:
-    """Formats large financial figures (e.g., Market Cap) into readable T/B/M units."""
-    if not isinstance(value, (int, float)) or value <= 0:
-        return "N/A"
-    if value >= 1_000_000_000_000:
-        return f"${value / 1_000_000_000_000:.2f}T"
-    if value >= 1_000_000_000:
-        return f"${value / 1_000_000_000:.2f}B"
-    if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
-    return f"${value:,.2f}"
 
 
 def _extract_news_headlines(ticker: yf.Ticker, symbol: str, limit: int = 5) -> list[str]:
@@ -68,68 +61,21 @@ def _extract_news_headlines(ticker: yf.Ticker, symbol: str, limit: int = 5) -> l
     return headlines
 
 
-@tool("Market Data and News Fetcher")
-def fetch_market_data(symbol: str) -> str:
+@tool("Market News and Catalysts Fetcher")
+def fetch_market_news(symbol: str) -> str:
     """
-    Fetches real-time price action, fundamental valuation ratios (P/E, Market Cap, Sector),
-    and recent news headlines for a given ticker symbol (e.g., AAPL, THYAO.IS, BTC-USD).
+    Fetches the latest market news headlines and catalysts for a given ticker symbol
+    (e.g., AAPL, THYAO.IS, BTC-USD).
     """
     clean_symbol = symbol.strip().upper()
     try:
         ticker = yf.Ticker(clean_symbol)
-        fast = ticker.fast_info
-
-        current_price = getattr(fast, "last_price", None)
-        prev_close = getattr(fast, "previous_close", None)
-        currency = getattr(fast, "currency", "USD")
-        market_cap_raw = getattr(fast, "market_cap", None)
-        high_52w = getattr(fast, "year_high", None)
-        low_52w = getattr(fast, "year_low", None)
-
-        daily_change = "N/A"
-        if isinstance(current_price, (int, float)) and isinstance(prev_close, (int, float)) and prev_close > 0:
-            pct = ((current_price - prev_close) / prev_close) * 100
-            daily_change = f"{pct:+.2f}%"
-
-        price_str = f"{current_price:.2f} {currency}" if isinstance(current_price, (int, float)) else "N/A"
-        range_52w = (
-            f"{low_52w:.2f} - {high_52w:.2f} {currency}"
-            if isinstance(low_52w, (int, float)) and isinstance(high_52w, (int, float))
-            else "N/A"
-        )
-
-        info = {}
-        try:
-            info = ticker.info or {}
-        except Exception:
-            info = {}
-
-        company_name = info.get("longName") or info.get("shortName") or clean_symbol
-        sector = info.get("sector", "N/A")
-        industry = info.get("industry", "N/A")
-        trailing_pe = info.get("trailingPE")
-        forward_pe = info.get("forwardPE")
-        profit_margin = info.get("profitMargins")
-
-        trailing_pe_str = f"{trailing_pe:.2f}" if isinstance(trailing_pe, (int, float)) else "N/A"
-        forward_pe_str = f"{forward_pe:.2f}" if isinstance(forward_pe, (int, float)) else "N/A"
-        margin_str = f"{profit_margin * 100:.2f}%" if isinstance(profit_margin, (int, float)) else "N/A"
-
         headlines = _extract_news_headlines(ticker, clean_symbol, limit=5)
-        news_section = "\n".join(headlines) if headlines else "No recent news headlines returned by provider."
-
-        return (
-            f"Asset: {company_name} ({clean_symbol})\n"
-            f"Sector / Industry: {sector} | {industry}\n"
-            f"Current Price: {price_str} (Daily Change: {daily_change})\n"
-            f"Market Cap: {_format_large_number(market_cap_raw)}\n"
-            f"Trailing P/E: {trailing_pe_str} | Forward P/E: {forward_pe_str}\n"
-            f"Profit Margin: {margin_str}\n"
-            f"52-Week Range: {range_52w}\n"
-            f"Latest News Headlines:\n{news_section}"
-        )
+        if not headlines:
+            return f"No recent news headlines returned by provider for {clean_symbol}."
+        return f"Latest News Headlines for {clean_symbol}:\n" + "\n".join(headlines)
     except Exception as e:
-        return f"Critical error fetching market data for {clean_symbol}: {str(e)}"
+        return f"Error fetching news headlines for {clean_symbol}: {str(e)}"
 
 
 def _build_llm(model_name: str) -> LLM:
@@ -161,13 +107,6 @@ def _run_with_failover(stage_name: str, task_runner) -> str:
     """
     Executes an isolated pipeline stage across MODEL_PRIORITY_CHAIN,
     failing over immediately on upstream 503/429/504 availability errors.
-
-    Codes that trigger failover:
-      - 503 UNAVAILABLE: model overloaded
-      - 429 RESOURCE_EXHAUSTED: quota/rate limit hit
-      - 504 DEADLINE_EXCEEDED: request timed out server-side (tenacity path in
-        google-genai SDK surfaces this after the single attempt allowed by
-        http_options.retry_options.attempts=1)
     """
     last_error = None
     for model_name in MODEL_PRIORITY_CHAIN:
@@ -177,28 +116,37 @@ def _run_with_failover(stage_name: str, task_runner) -> str:
         except Exception as exc:
             last_error = exc
             error_msg = str(exc)
-            if any(code in error_msg for code in (
-                "503", "UNAVAILABLE",
-                "429", "RESOURCE_EXHAUSTED",
-                "504", "DEADLINE_EXCEEDED",
-            )):
-                print(f"⚠️ [{stage_name}] {model_name} failed ({error_msg[:60].strip()}). Switching to next model...")
+            if any(
+                code in error_msg
+                for code in (
+                    "503",
+                    "UNAVAILABLE",
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "504",
+                    "DEADLINE_EXCEEDED",
+                )
+            ):
+                print(
+                    f"⚠️ [{stage_name}] {model_name} failed ({error_msg[:60].strip()}). Switching to next model..."
+                )
                 continue
             raise
 
     raise RuntimeError(f"[{stage_name}] All models in priority chain failed. Last error: {last_error}")
 
 
-def _collect_market_briefing(symbol: str, llm: LLM) -> str:
-    """Stage 1: Gathers live metrics, valuation ratios, and news headlines."""
+def _collect_market_briefing(symbol: str, quant_summary_json: str, llm: LLM) -> str:
+    """Stage 1: Gathers live news headlines and combines them with deterministic quant metrics."""
     data_analyst = Agent(
         role="Senior Financial Data Analyst",
-        goal=f"Collect and structure accurate market metrics, valuation ratios, and recent news for {symbol}.",
+        goal=f"Retrieve recent news catalysts for {symbol} and structure them alongside verified quantitative metrics.",
         backstory=(
             "You are a meticulous Wall Street equity research analyst. "
-            "You extract exact market figures, valuation multiples, and news catalysts without speculation."
+            "You never guess or alter numerical outputs—you combine verified quantitative figures "
+            "with real news catalysts into a clean briefing."
         ),
-        tools=[fetch_market_data],
+        tools=[fetch_market_news],
         llm=llm,
         max_iter=3,
         max_retry_limit=0,
@@ -207,13 +155,13 @@ def _collect_market_briefing(symbol: str, llm: LLM) -> str:
 
     research_task = Task(
         description=(
-            f"Use the 'Market Data and News Fetcher' tool once to retrieve the full financial profile, "
-            f"valuation ratios, and latest news headlines for '{symbol}'. "
-            "Present all retrieved metrics and headlines in a well-structured briefing."
+            f"Use the 'Market News and Catalysts Fetcher' tool once to retrieve the latest news headlines for '{symbol}'.\n"
+            f"Combine those headlines with the deterministic quantitative profile below into a structured briefing:\n\n"
+            f"{quant_summary_json}"
         ),
         expected_output=(
-            "A complete structured briefing containing company profile, price & daily change, "
-            "market cap, Trailing/Forward P/E, profit margin, 52-week range, and all retrieved news headlines."
+            "A complete structured briefing containing all verified fundamental multiples, technical indicators, "
+            "risk metrics, and all retrieved news headlines."
         ),
         agent=data_analyst,
     )
@@ -228,15 +176,16 @@ def _collect_market_briefing(symbol: str, llm: LLM) -> str:
 
 
 def _generate_strategy_report(symbol: str, language: str, briefing: str, llm: LLM) -> str:
-    """Stage 2: Synthesizes the verified market briefing into a 4-section institutional report."""
+    """Stage 2: Synthesizes the verified quantitative & news briefing into a 5-section institutional report."""
     target_language = "Turkish" if language.lower() == "tr" else "English"
 
     strategist = Agent(
-        role="Chief Investment Strategist",
+        role="Chief Investment Strategist & Quantitative Risk Officer",
         goal=f"Deliver a comprehensive, deeply reasoned financial research report for {symbol} in {target_language}.",
         backstory=(
-            "You are an institutional investment strategist who synthesizes fundamental valuation multiples, "
-            "price momentum, and news sentiment into clear, objective research reports."
+            "You are an institutional investment strategist who synthesizes deterministic technical indicators "
+            "(RSI, MACD, Bollinger Bands, Moving Averages), risk-adjusted metrics (Sharpe Ratio, Max Drawdown), "
+            "fundamental valuation multiples, and news sentiment into objective research reports."
         ),
         llm=llm,
         max_iter=2,
@@ -246,17 +195,18 @@ def _generate_strategy_report(symbol: str, language: str, briefing: str, llm: LL
 
     strategy_task = Task(
         description=(
-            f"Using the verified market briefing below for {symbol}, write a comprehensive, "
+            f"Using ONLY the verified quantitative and news briefing below for {symbol}, write a comprehensive, "
             f"institutional-grade financial analysis report in {target_language}.\n\n"
-            f"--- VERIFIED MARKET BRIEFING ---\n{briefing}\n--------------------------------\n\n"
-            "Structure the report clearly under these four sections:\n"
-            "1. Overview & Valuation Analysis (evaluate price level, 52-week positioning, and P/E multiples)\n"
-            "2. Market Sentiment & News Catalysts (analyze the impact of the retrieved news headlines)\n"
-            "3. Key Opportunities & Risk Factors (balanced bull vs. bear drivers)\n"
-            "4. Executive Summary\n"
-            "Maintain an objective, analytical tone suitable for institutional research without issuing direct buy/sell advice."
+            f"--- VERIFIED QUANTITATIVE & NEWS BRIEFING ---\n{briefing}\n---------------------------------------------\n\n"
+            "Structure the report clearly under these five sections:\n"
+            "1. Executive Summary & Market Positioning\n"
+            "2. Fundamental & Valuation Analysis (evaluate price level, 52-week positioning, P/E, P/B, EV/EBITDA, margins, and free cash flow)\n"
+            "3. Technical & Momentum Analysis (interpret SMA 20/50/200 trend alignment, 14-day RSI regime, MACD signal, and Bollinger Bands)\n"
+            "4. Quantitative Risk Profile (analyze annualized volatility, Sharpe ratio, and maximum drawdown)\n"
+            "5. Market Sentiment, News Catalysts & Risk Factors (analyze news impact alongside balanced bull vs. bear drivers)\n\n"
+            "Cite the exact numerical metrics from the briefing. Maintain an objective, analytical tone suitable for institutional research without issuing direct buy/sell advice."
         ),
-        expected_output=f"A thorough, 4-section institutional financial analysis report written in {target_language}.",
+        expected_output=f"A thorough, 5-section institutional financial & quantitative research report written in {target_language}.",
         agent=strategist,
     )
 
@@ -269,25 +219,67 @@ def _generate_strategy_report(symbol: str, language: str, briefing: str, llm: LL
     return str(crew.kickoff())
 
 
-def run_financial_analysis(symbol: str, language: str = "en") -> str:
+def run_financial_analysis(
+    symbol: str,
+    language: str = "en",
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
     """
-    Orchestrates the two-stage financial analysis pipeline with stage-isolated
-    multi-model failover for high availability.
+    Orchestrates deterministic quantitative computation followed by the two-stage
+    multi-agent pipeline with stage-isolated model failover and live progress hooks.
     """
+    clean_symbol = symbol.strip().upper()
+
+    # Step 0: Deterministic Quantitative Engine (Zero LLM math hallucination)
+    quant_profile = compute_quantitative_profile(clean_symbol)
+    if progress_callback:
+        rsi_val = quant_profile["technical_indicators"]["rsi_14"]
+        sharpe_val = quant_profile["risk_metrics"]["sharpe_ratio"]
+        progress_callback(
+            "QUANT_COMPUTED",
+            f"Computed RSI ({rsi_val}), MACD, Sharpe Ratio ({sharpe_val}), and 120-day OHLCV chart series.",
+        )
+
+    # Keep LLM prompt focused by excluding the 120 raw chart candles
+    quant_for_llm = {k: v for k, v in quant_profile.items() if k != "chart_series"}
+    quant_summary_json = json.dumps(quant_for_llm, indent=2)
+
+    # Step 1: News & Catalyst Research Agent
+    if progress_callback:
+        progress_callback(
+            "STAGE_1_RESEARCH",
+            "Senior Data Analyst Agent is collecting market news and aligning quantitative metrics...",
+        )
     briefing = _run_with_failover(
         "Stage 1: Data Research",
-        lambda llm: _collect_market_briefing(symbol, llm),
+        lambda llm: _collect_market_briefing(clean_symbol, quant_summary_json, llm),
     )
-    return _run_with_failover(
+
+    # Step 2: Chief Investment Strategist Agent
+    if progress_callback:
+        progress_callback(
+            "STAGE_2_STRATEGY",
+            "Chief Investment Strategist Agent is writing the 5-section institutional report...",
+        )
+    report_text = _run_with_failover(
         "Stage 2: Strategy Report",
-        lambda llm: _generate_strategy_report(symbol, language, briefing, llm),
+        lambda llm: _generate_strategy_report(clean_symbol, language, briefing, llm),
     )
+
+    return {
+        "report": report_text,
+        "quant_data": quant_profile,
+    }
 
 
 if __name__ == "__main__":
     print("🚀 Running AlphaPulse AI Agents (Test: AAPL)...")
-    report = run_financial_analysis("AAPL", language="en")
+    result = run_financial_analysis(
+        "AAPL",
+        language="en",
+        progress_callback=lambda step, msg: print(f"📡 [{step}] {msg}"),
+    )
     print("\n" + "=" * 60)
     print("📊 GENERATED INSTITUTIONAL ANALYSIS REPORT:")
     print("=" * 60)
-    print(report)
+    print(result["report"])

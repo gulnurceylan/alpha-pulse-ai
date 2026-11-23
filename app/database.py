@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import JSON, Column, DateTime, Integer, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.sql import func
 
@@ -14,13 +14,19 @@ class AnalysisReport(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String(20), index=True, nullable=False)  # e.g., AAPL, THYAO.IS
-    status = Column(String(20), default="PENDING", nullable=False)  # PENDING, COMPLETED, FAILED
+    status = Column(String(20), default="PENDING", nullable=False)  # PENDING, PROCESSING, COMPLETED, FAILED
     report = Column(Text, nullable=True)
+    quant_data = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # Safely add quant_data column to existing table without losing stored records
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE analysis_reports ADD COLUMN IF NOT EXISTS quant_data JSON;")
+        )
 
 
 def get_db():
@@ -33,4 +39,4 @@ def get_db():
 
 if __name__ == "__main__":
     init_db()
-    print("✅ PostgreSQL connection successful and 'analysis_reports' table is ready!")
+    print("✅ PostgreSQL schema upgraded and 'analysis_reports' table is ready!")
